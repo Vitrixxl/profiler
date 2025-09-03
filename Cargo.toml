@@ -5,5 +5,5 @@ edition = "2024"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-zip = {version= "2", features=["deflate"]}
+zip = {version= "4.6.0", features=["deflate"]}
 

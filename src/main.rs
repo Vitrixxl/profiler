@@ -1,97 +1,90 @@
 use clap::{ArgGroup, Parser};
 use std::{
     env,
-    fs::File,
-    io::{Read, Result, Write, copy},
+    fs::{File, remove_file},
+    io::{self, Error, Read, Result, Write},
     net::{TcpListener, TcpStream},
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
-use zip::write::FileOptions;
 use zip::{CompressionMethod, ZipWriter};
+use zip::{ZipArchive, write::FileOptions};
+mod utils;
 
-const BUFFER_SIZE: usize = 1024 * 1024;
+const BUFFER_SIZE: usize = 1 << 30;
 
 #[derive(Parser)]
 #[command(
     name = "profiler",
     version = "0.0.1",
     about = "A simple cli tool to send files securly in peer to peer",
-    group(ArgGroup::new("mode").args(["listen", "connect"]).required(true))
+    group(ArgGroup::new("mode").args(["recieve", "send"]).required(true))
 )]
 struct Args {
     #[arg(short, long)]
-    listen: bool,
+    recieve: bool,
 
     #[arg(short, long, requires_all = ["address",  "input"])]
-    connect: bool,
+    send: bool,
 
-    #[arg(short, long, requires = "connect")]
+    #[arg(short, long, requires = "send")]
     address: Option<String>,
 
-    #[arg(short = 'o', long = "output", requires = "listen")]
+    #[arg(short = 'o', long = "output", requires = "recieve")]
     output: Option<String>,
 
-    #[arg(short, long, requires = "connect")]
+    #[arg(short, long, requires = "send")]
     input: Option<String>,
-}
-
-fn write_file_into_zip(
-    mut src: std::fs::File,
-    zip: &mut ZipWriter<std::fs::File>,
-) -> std::io::Result<u64> {
-    let mut buf = vec![0u8; 1 * 4096 * 1024]; // 1 MiB
-    let mut total: u64 = 0;
-    let size = src.metadata().ok().map(|m| m.len());
-
-    loop {
-        let n = src.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        zip.write_all(&buf[..n])?;
-        total += n as u64;
-
-        // log toutes les ~32 MiB écrites
-        if total % (32 * 1024 * 1024) < n as u64 {
-            if let Some(sz) = size {
-                let pct = (total as f64 / sz as f64 * 100.0) as u8;
-                println!("[*] Progress: {}/{} (~{}%)", total, sz, pct);
-            } else {
-                println!("[*] Progress: {} bytes écrits…", total);
-            }
-        }
-    }
-    zip.flush()?;
-    Ok(total)
 }
 
 fn zip_file<P: AsRef<Path>>(path: P) -> Result<String> {
     println!("[*] Compression de {:?}", path.as_ref());
 
     let duration = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-    let ts = duration.as_secs();
+    let ts = duration.as_millis();
     let tmp_zip_path = format!("{}.zip", ts);
 
     println!("[*] Fichier zip temporaire: {}", tmp_zip_path);
 
     let file = File::create(&tmp_zip_path)?;
-    let file_to_write = File::open(path)?;
+    let mut file_to_write = File::open(&path)?;
     let mut zip = ZipWriter::new(file);
 
     let options: FileOptions<()> = FileOptions::default()
-        .compression_method(CompressionMethod::Stored)
-        .unix_permissions(0o644)
-        .large_file(true);
+        .compression_method(CompressionMethod::Deflated)
+        .unix_permissions(0o644);
 
     println!("[*] Ajout du fichier dans l'archive...");
-    zip.start_file("file", options)?;
-    write_file_into_zip(file_to_write, &mut zip)?;
+    let name = path
+        .as_ref()
+        .file_name()
+        .and_then(|s| s.to_str()) // OsStr -> Option<&str>
+        .ok_or_else(|| {
+            Error::new(
+                io::ErrorKind::InvalidInput,
+                "Nom de fichier non UTF-8 ou chemin invalide",
+            )
+        })?;
+    zip.start_file(name, options)?;
+    utils::copy(&mut file_to_write, &mut zip, 1 << 30)?;
     zip.finish()?;
+
+    remove_file(&path)?;
 
     println!("[+] Archive {} créée avec succès", tmp_zip_path);
 
     Ok(tmp_zip_path)
+}
+
+fn unzip_file<P: AsRef<Path>>(path: P) -> Result<()> {
+    println!("Opening the file");
+    let file = File::open(&path)?;
+
+    let mut archive = ZipArchive::new(file)?;
+    println!("Extracting");
+    archive.extract(env::current_dir()?)?; // crée les dossiers et écrit tous les fichiers
+    remove_file(&path)?;
+    Ok(())
 }
 
 fn send_file(path: &str, stream: &mut TcpStream) -> Result<()> {
@@ -104,7 +97,7 @@ fn send_file(path: &str, stream: &mut TcpStream) -> Result<()> {
     println!("[*] Ouverture de l'archive: {}", zip_path);
 
     let mut file = File::open(&zip_path)?;
-    let mut buf = [0u8; BUFFER_SIZE];
+    let mut buf = vec![0u8; BUFFER_SIZE];
 
     println!("[*] Début du transfert...");
     loop {
@@ -119,6 +112,11 @@ fn send_file(path: &str, stream: &mut TcpStream) -> Result<()> {
     Ok(())
 }
 
+fn get_timestamps() -> Result<u128> {
+    let duration = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+    Ok(duration.as_millis())
+}
+
 fn listen(args: &Args) -> Result<()> {
     println!("[*] Mise en écoute sur localhost:6969...");
     let listener = TcpListener::bind("localhost:6969")?;
@@ -127,8 +125,13 @@ fn listen(args: &Args) -> Result<()> {
     let (mut stream, addr) = listener.accept()?;
     println!("[+] Connexion acceptée de {}", addr);
 
-    let mut buf = [0u8; BUFFER_SIZE];
-    let mut file = File::create(args.output.as_ref().unwrap())?;
+    let ts = get_timestamps()?;
+    let zip_path = Path::new(&env::current_dir()?).join(format!("{}.zip", ts));
+
+    let mut zip_file = File::create(&zip_path)?;
+
+    let mut buf = vec![0u8; BUFFER_SIZE]; // heap
+
     println!("[*] Écriture dans {:?}", args.output.as_ref().unwrap());
 
     loop {
@@ -136,8 +139,10 @@ fn listen(args: &Args) -> Result<()> {
         if n == 0 {
             break;
         }
-        file.write_all(&buf[..n])?;
+        zip_file.write_all(&buf[..n])?;
     }
+
+    unzip_file(zip_path)?;
 
     println!(
         "[+] Fichier reçu et sauvegardé dans {:?}",
@@ -159,10 +164,10 @@ fn connect(args: &Args) -> Result<()> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    if args.listen {
+    if args.recieve {
         println!("[*] Mode écoute");
         listen(&args).unwrap();
-    } else if args.connect {
+    } else if args.send {
         println!("[*] Mode connexion");
         connect(&args).unwrap();
     }

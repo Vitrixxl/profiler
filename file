@@ -1,0 +1,160 @@
+use clap::{ArgGroup, Parser};
+use std::{
+    env,
+    fs::{File, remove_file},
+    io::{Read, Result, Write},
+    net::{TcpListener, TcpStream},
+    path::Path,
+    time::{SystemTime, UNIX_EPOCH},
+};
+use zip::{CompressionMethod, ZipWriter};
+use zip::{ZipArchive, write::FileOptions};
+mod utils;
+
+const BUFFER_SIZE: usize = 1 << 30;
+
+#[derive(Parser)]
+#[command(
+    name = "profiler",
+    version = "0.0.1",
+    about = "A simple cli tool to send files securly in peer to peer",
+    group(ArgGroup::new("mode").args(["recieve", "send"]).required(true))
+)]
+struct Args {
+    #[arg(short, long)]
+    recieve: bool,
+
+    #[arg(short, long, requires_all = ["address",  "input"])]
+    send: bool,
+
+    #[arg(short, long, requires = "send")]
+    address: Option<String>,
+
+    #[arg(short = 'o', long = "output", requires = "recieve")]
+    output: Option<String>,
+
+    #[arg(short, long, requires = "send")]
+    input: Option<String>,
+}
+
+fn zip_file<P: AsRef<Path>>(path: P) -> Result<String> {
+    println!("[*] Compression de {:?}", path.as_ref());
+
+    let duration = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+    let ts = duration.as_millis();
+    let tmp_zip_path = format!("{}.zip", ts);
+
+    println!("[*] Fichier zip temporaire: {}", tmp_zip_path);
+
+    let file = File::create(&tmp_zip_path)?;
+    let mut file_to_write = File::open(path)?;
+    let mut zip = ZipWriter::new(file);
+
+    let options: FileOptions<()> = FileOptions::default()
+        .compression_method(CompressionMethod::Deflated)
+        .unix_permissions(0o644);
+
+    println!("[*] Ajout du fichier dans l'archive...");
+    zip.start_file("file", options)?;
+    utils::copy(&mut file_to_write, &mut zip, 1 << 30)?;
+    zip.finish()?;
+
+    println!("[+] Archive {} créée avec succès", tmp_zip_path);
+
+    Ok(tmp_zip_path)
+}
+
+fn unzip_file<P: AsRef<Path>>(path: P) -> Result<()> {
+    let file = File::open(&path)?;
+    let mut archive = ZipArchive::new(file)?;
+    archive.extract(env::current_dir()?)?; // crée les dossiers et écrit tous les fichiers
+    remove_file(&path)?;
+    Ok(())
+}
+
+fn send_file(path: &str, stream: &mut TcpStream) -> Result<()> {
+    println!("[*] Préparation à l'envoi du fichier: {}", path);
+
+    let pwd = env::current_dir()?;
+    let filepath = Path::new(&pwd).join(path);
+
+    let zip_path = zip_file(filepath)?;
+    println!("[*] Ouverture de l'archive: {}", zip_path);
+
+    let mut file = File::open(&zip_path)?;
+    let mut buf = vec![0u8; BUFFER_SIZE];
+
+    println!("[*] Début du transfert...");
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        stream.write_all(&buf[..n])?;
+    }
+    println!("[+] Transfert terminé");
+
+    Ok(())
+}
+
+fn get_timestamps() -> Result<u128> {
+    let duration = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+    Ok(duration.as_millis())
+}
+
+fn listen(args: &Args) -> Result<()> {
+    println!("[*] Mise en écoute sur localhost:6969...");
+    let listener = TcpListener::bind("localhost:6969")?;
+
+    println!("[*] Attente de connexion...");
+    let (mut stream, addr) = listener.accept()?;
+    println!("[+] Connexion acceptée de {}", addr);
+
+    let ts = get_timestamps()?;
+    let zip_path = Path::new(&env::current_dir()?).join(format!("{}.zip", ts));
+
+    let mut zip_file = File::create(&zip_path)?;
+
+    let mut buf = vec![0u8; BUFFER_SIZE]; // heap
+
+    println!("[*] Écriture dans {:?}", args.output.as_ref().unwrap());
+
+    loop {
+        let n = stream.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        zip_file.write_all(&buf[..n])?;
+    }
+
+    unzip_file(zip_path)?;
+
+    println!(
+        "[+] Fichier reçu et sauvegardé dans {:?}",
+        args.output.as_ref().unwrap()
+    );
+    Ok(())
+}
+
+fn connect(args: &Args) -> Result<()> {
+    let address = args.address.as_ref().unwrap();
+    println!("[*] Connexion à {}...", address);
+
+    let mut stream = TcpStream::connect(address)?;
+    println!("[+] Connecté à {}", address);
+
+    send_file(args.input.as_ref().unwrap(), &mut stream)?;
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+    if args.recieve {
+        println!("[*] Mode écoute");
+        listen(&args).unwrap();
+    } else if args.send {
+        println!("[*] Mode connexion");
+        connect(&args).unwrap();
+    }
+    Ok(())
+}
