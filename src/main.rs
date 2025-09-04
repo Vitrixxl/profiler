@@ -1,14 +1,12 @@
 use clap::{ArgGroup, Parser};
 use std::{
     env,
-    fs::{File, remove_file},
-    io::{self, Error, Read, Result, Write},
+    fs::File,
+    io::{Read, Result, Write},
     net::{TcpListener, TcpStream},
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
-use zip::{CompressionMethod, ZipWriter};
-use zip::{ZipArchive, write::FileOptions};
 mod utils;
 
 const BUFFER_SIZE: usize = 1 << 30;
@@ -37,63 +35,13 @@ struct Args {
     input: Option<String>,
 }
 
-fn zip_file<P: AsRef<Path>>(path: P) -> Result<String> {
-    println!("[*] Compression de {:?}", path.as_ref());
-
-    let duration = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-    let ts = duration.as_millis();
-    let tmp_zip_path = format!("{}.zip", ts);
-
-    println!("[*] Fichier zip temporaire: {}", tmp_zip_path);
-
-    let file = File::create(&tmp_zip_path)?;
-    let mut file_to_write = File::open(&path)?;
-    let mut zip = ZipWriter::new(file);
-
-    let options: FileOptions<()> = FileOptions::default()
-        .compression_method(CompressionMethod::Deflated)
-        .unix_permissions(0o644);
-
-    println!("[*] Ajout du fichier dans l'archive...");
-    let name = path
-        .as_ref()
-        .file_name()
-        .and_then(|s| s.to_str()) // OsStr -> Option<&str>
-        .ok_or_else(|| {
-            Error::new(
-                io::ErrorKind::InvalidInput,
-                "Nom de fichier non UTF-8 ou chemin invalide",
-            )
-        })?;
-    zip.start_file(name, options)?;
-    utils::copy(&mut file_to_write, &mut zip, 1 << 30)?;
-    zip.finish()?;
-
-    remove_file(&path)?;
-
-    println!("[+] Archive {} créée avec succès", tmp_zip_path);
-
-    Ok(tmp_zip_path)
-}
-
-fn unzip_file<P: AsRef<Path>>(path: P) -> Result<()> {
-    println!("Opening the file");
-    let file = File::open(&path)?;
-
-    let mut archive = ZipArchive::new(file)?;
-    println!("Extracting");
-    archive.extract(env::current_dir()?)?; // crée les dossiers et écrit tous les fichiers
-    remove_file(&path)?;
-    Ok(())
-}
-
 fn send_file(path: &str, stream: &mut TcpStream) -> Result<()> {
     println!("[*] Préparation à l'envoi du fichier: {}", path);
 
     let pwd = env::current_dir()?;
     let filepath = Path::new(&pwd).join(path);
 
-    let zip_path = zip_file(filepath)?;
+    let zip_path = utils::zip_files(filepath)?;
     println!("[*] Ouverture de l'archive: {}", zip_path);
 
     let mut file = File::open(&zip_path)?;
@@ -132,7 +80,7 @@ fn listen(args: &Args) -> Result<()> {
 
     let mut buf = vec![0u8; BUFFER_SIZE]; // heap
 
-    println!("[*] Écriture dans {:?}", args.output.as_ref().unwrap());
+    // println!("[*] Écriture dans {:?}", args.output.as_ref().unwrap());
 
     loop {
         let n = stream.read(&mut buf)?;
@@ -142,7 +90,11 @@ fn listen(args: &Args) -> Result<()> {
         zip_file.write_all(&buf[..n])?;
     }
 
-    unzip_file(zip_path)?;
+    zip_file.flush()?;
+    drop(zip_file);
+
+    utils::unzip_files(zip_path.to_str().unwrap(), args.output.clone())
+        .expect("Error while unziping");
 
     println!(
         "[+] Fichier reçu et sauvegardé dans {:?}",
